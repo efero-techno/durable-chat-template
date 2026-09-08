@@ -1,88 +1,200 @@
 import {
-	type Connection,
-	Server,
-	type WSMessage,
-	routePartykitRequest,
+  type Connection,
+  Server,
+  type WSMessage,
+  routePartykitRequest,
 } from "partyserver";
 
-import type { ChatMessage, Message } from "../shared";
+type PlayerState = {
+  status: "waiting" | "matched";
+  peerId?: string;
+  matchId?: string;
+  side?: "A" | "B";
+  score?: number;
+};
 
 export class Chat extends Server<Env> {
-	static options = { hibernate: true };
+  static options = { hibernate: true };
 
-	messages = [] as ChatMessage[];
+  findWaiting(excludeId: string) {
+    for (const c of this.getConnections()) {
+      if (c.id === excludeId) continue;
 
-	broadcastMessage(message: Message, exclude?: string[]) {
-		this.broadcast(JSON.stringify(message), exclude);
-	}
+      const state = c.state as PlayerState | null;
 
-	onStart() {
-		// this is where you can initialize things that need to be done before the server starts
-		// for example, load previous messages from a database or a service
+      if (!state || state.status === "waiting") {
+        return c;
+      }
+    }
 
-		// create the messages table if it doesn't exist
-		this.ctx.storage.sql.exec(
-			`CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT, role TEXT, content TEXT)`,
-		);
+    return null;
+  }
 
-		// load the messages from the database
-		this.messages = this.ctx.storage.sql
-			.exec(`SELECT * FROM messages`)
-			.toArray() as ChatMessage[];
-	}
+  pairPlayers(a: Connection, b: Connection) {
+    const matchId = crypto.randomUUID();
 
-	onConnect(connection: Connection) {
-		connection.send(
-			JSON.stringify({
-				type: "all",
-				messages: this.messages,
-			} satisfies Message),
-		);
-	}
+    a.setState({
+      status: "matched",
+      peerId: b.id,
+      matchId,
+      side: "A",
+      score: 0,
+    });
 
-	saveMessage(message: ChatMessage) {
-		// check if the message already exists
-		const existingMessage = this.messages.find((m) => m.id === message.id);
-		if (existingMessage) {
-			this.messages = this.messages.map((m) => {
-				if (m.id === message.id) {
-					return message;
-				}
-				return m;
-			});
-		} else {
-			this.messages.push(message);
-		}
+    b.setState({
+      status: "matched",
+      peerId: a.id,
+      matchId,
+      side: "B",
+      score: 0,
+    });
 
-		// Use parameterized queries to prevent SQL injection
-		this.ctx.storage.sql.exec(
-			`INSERT INTO messages (id, user, role, content) VALUES (?, ?, ?, ?)
-			 ON CONFLICT (id) DO UPDATE SET content = ?`,
-			message.id,
-			message.user,
-			message.role,
-			message.content,
-			message.content,
-		);
-	}
+    a.send(
+      JSON.stringify({
+        type: "matched",
+        matchId,
+        side: "A",
+      }),
+    );
 
-	onMessage(connection: Connection, message: WSMessage) {
-		// let's broadcast the raw message to everyone else
-		this.broadcast(message);
+    b.send(
+      JSON.stringify({
+        type: "matched",
+        matchId,
+        side: "B",
+      }),
+    );
+  }
 
-		// let's update our local messages store
-		const parsed = JSON.parse(message as string) as Message;
-		if (parsed.type === "add" || parsed.type === "update") {
-			this.saveMessage(parsed);
-		}
-	}
+  tryMatch(connection: Connection) {
+    const other = this.findWaiting(connection.id);
+
+    if (!other) {
+      connection.setState({
+        status: "waiting",
+        score: 0,
+      });
+
+      connection.send(
+        JSON.stringify({
+          type: "waiting",
+        }),
+      );
+
+      return;
+    }
+
+    this.pairPlayers(other, connection);
+  }
+
+  onConnect(connection: Connection) {
+    connection.setState({
+      status: "waiting",
+      score: 0,
+    });
+
+    this.tryMatch(connection);
+  }
+
+  onMessage(connection: Connection, message: WSMessage) {
+    if (typeof message !== "string") return;
+    if (message.length > 8192) return;
+
+    let data: any;
+
+    try {
+      data = JSON.parse(message);
+    } catch {
+      return;
+    }
+
+    if (data.type === "ping") {
+      connection.send(
+        JSON.stringify({
+          type: "pong",
+          time: Date.now(),
+        }),
+      );
+      return;
+    }
+
+    const state = connection.state as PlayerState | null;
+
+    if (!state || state.status !== "matched" || !state.peerId) {
+      connection.send(
+        JSON.stringify({
+          type: "waiting",
+        }),
+      );
+      return;
+    }
+
+    const opponent = this.getConnection(state.peerId);
+
+    if (!opponent) {
+      connection.setState({
+        status: "waiting",
+        score: 0,
+      });
+
+      this.tryMatch(connection);
+      return;
+    }
+
+    opponent.send(
+      JSON.stringify({
+        ...data,
+        from: connection.id,
+        matchId: state.matchId,
+        serverTime: Date.now(),
+      }),
+    );
+  }
+
+  onClose(
+    connection: Connection,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean,
+  ) {
+    const state = connection.state as PlayerState | null;
+
+    if (!state?.peerId) return;
+
+    const opponent = this.getConnection(state.peerId);
+
+    if (!opponent) return;
+
+    opponent.setState({
+      status: "waiting",
+      score: 0,
+    });
+
+    opponent.send(
+      JSON.stringify({
+        type: "opponent_left",
+      }),
+    );
+
+    this.tryMatch(opponent);
+  }
 }
 
 export default {
-	async fetch(request, env) {
-		return (
-			(await routePartykitRequest(request, { ...env })) ||
-			env.ASSETS.fetch(request)
-		);
-	},
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/health") {
+      return Response.json({
+        ok: true,
+        game: "ZigGo Run: Astro Brawl",
+        service: "online-1v1",
+      });
+    }
+
+    return (
+      (await routePartykitRequest(request, { ...env })) ||
+      env.ASSETS.fetch(request)
+    );
+  },
 } satisfies ExportedHandler<Env>;
